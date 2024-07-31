@@ -1,0 +1,6 @@
+#!/bin/bash
+
+SCRIPTPATH=$(cd $(dirname $0); pwd -P)
+export LD_LIBRARY_PATH=$SCRIPTPATH/../lib
+
+$SCRIPTPATH/lloader $SCRIPTPATH/isolate_area_set.l $*

@@ -1,0 +1,606 @@
+#!/bin/bash
+
+SCRIPTPATH=$(cd $(dirname $0); pwd -P)
+RWINI="${SCRIPTPATH}/rwini"
+
+export LD_LIBRARY_PATH=$SCRIPTPATH/../lib
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+#如果开启asan内存检测
+if [ -f ${SCRIPTPATH}/../lib/libasan.so ];then
+    [ ! -d ${SCRIPTPATH}/../var/log/asan ] && mkdir -p ${SCRIPTPATH}/../var/log/asan
+    export ASAN_OPTIONS=log_path=$SCRIPTPATH/../var/log/asan/asan.log
+fi
+
+mkdir -p $SCRIPTPATH/../var
+if [ -d /run ]; then
+	MPID_FILE=/run/edr_monitor${SCRIPTPATH//\//_}.pid
+else
+	MPID_FILE=/tmp/edr_monitor${SCRIPTPATH//\//_}.pid
+fi
+
+SERVICES_PATH="$SCRIPTPATH/../services"
+SERVICES_STOPPED_PATH="$SCRIPTPATH/../services_stopped"
+mkdir -p $SERVICES_STOPPED_PATH
+
+SERVICES_MASKED_PATH="$SCRIPTPATH/../services_masked"
+mkdir -p $SERVICES_MASKED_PATH
+
+centos_5_flag=0
+if [ -f /etc/redhat-release ]; then
+    # Red Hat Enterprise Linux Server release 7.4 (Maipo) => 7.6
+    # CentOS Linux release 7.6.1810 (Core) => 7.6
+    # CentOS release 6.5 (Final) => 6.5
+    # NeoKylin Linux Desktop release 6.0 => 6.0
+    cat /etc/redhat-release | grep -E '^[ ]*CentOS.*[ ]+5' > /dev/null 2>&1
+    if [ $? -eq 0 ]; then
+        centos_5_flag=1
+    fi 
+fi
+
+
+# 用当前脚本的执行路径判断是MGR还是agent，MGR为0，agent为1，未知为2
+function location_of_script()
+{
+    local loc_mgr=`echo "${SCRIPTPATH}" | grep manager`
+    local loc_agent=`echo "${SCRIPTPATH}" | grep agent`
+    
+    if [ ! -z "${loc_mgr}" ]; then
+        echo "0"
+    elif [ ! -z "${loc_agent}" ]; then
+        echo "1"
+    else
+        echo "2"
+    fi
+    
+    return 0
+}
+
+
+function pidof_monitor()
+{
+	local mpid=`pidof $SCRIPTPATH/edr_monitor`
+	#compatible to centos 5
+	if [ $centos_5_flag -eq 1 ] ; then
+		mpid=`pidof edr_monitor`
+	fi
+	echo "$mpid"
+}
+
+function pidof_oldmonitor()
+{
+	local mpid=`pidof $SCRIPTPATH/eps_monitor`
+	if [ $centos_5_flag -eq 1 ] ; then
+		mpid=`pidof eps_monitor`
+	fi
+	echo "$mpid"
+}
+
+function pidof_agent()
+{
+	local agent_pid=`pidof $SCRIPTPATH/edr_agent`
+	echo $agent_pid
+}
+
+fmpidold=`pidof_oldmonitor`
+if [ ! -f "$SCRIPTPATH/edr_monitor" ];then
+	echo "$SCRIPTPATH/edr_monitor is not exist"
+else
+	if [ -n "$fmpidold" ]; then
+		kill $fmpidold
+	fi
+fi
+
+function wait_moniotr_start()
+{
+	for (( i=0; i<15; i++)); do
+		sleep 1
+		local mpid=`pidof_monitor`
+		if [ -n "$mpid" ]; then
+			return 0
+		fi
+	done
+
+	return 1
+}
+
+function wait_moniotr_stop()
+{
+	# use longer timeout, because some daemon may stop lagged
+	for (( i=0; i<300; i++)); do
+		sleep 1
+		local mpid=`pidof_monitor`
+		local mpidold=`pidof_oldmonitor`
+		if [ -z "$mpid" -a -z "$mpidold" ]; then
+			return 0
+		fi
+	done
+
+	return 1
+}
+
+function wait_agent_stop()
+{
+	for (( i=0; i<15; i++)); do
+		sleep 1
+		local agent_pid=`pidof_agent`
+		if [ -z "$agent_pid" ]; then
+			return 0
+		fi
+	done
+
+	return 1
+}
+
+function start_all()
+{
+	if [ ! -f $MPID_FILE ]; then
+
+		if [ -x "${SCRIPTPATH}/start_pre.sh" ]; then
+			${SCRIPTPATH}/start_pre.sh
+		fi
+
+		$SCRIPTPATH/edr_monitor
+
+		#删除禁用标记
+		if [ -f /run/edr_forbidden ]; then
+			rm -f /run/edr_forbidden
+		fi
+
+		if wait_moniotr_start; then
+			echo "`pidof_monitor`" >$MPID_FILE
+			sleep 1
+			if [ -x "${SCRIPTPATH}/start_post.sh" ]; then
+				${SCRIPTPATH}/start_post.sh
+			fi
+			echo "edr start success"
+			return 0
+		else
+			echo "edr start failed"
+			return 1
+		fi
+	else
+		echo "edr already started"
+		return 0
+	fi
+}
+
+function get_cmdline_by_pid()
+{
+	local pid=$1
+	local cmdline=`cat /proc/${pid}/cmdline`
+	echo $cmdline
+}
+
+function get_path_by_pid()
+{
+	local pid=$1
+	local path=`readlink /proc/${pid}/exe`
+	echo $path
+}
+
+function get_ppid()
+{
+	local pid=$1
+	local ppid=`cat /proc/${pid}/stat | awk '{print $4}'`
+	echo $ppid
+}
+
+function kill_by_pid()
+{
+	local pid=$1
+	if [ ! -d /proc/${pid} ]; then
+		return 0
+	fi
+	kill $pid
+	sleep 1
+	if [ ! -d /proc/$pid ]; then
+		return 0
+	fi
+	kill -9 $pid
+	return 0
+}
+
+function list_and_kill()
+{
+	local binary=$1
+	local ret=0
+	while read line
+	do
+		local list_pid=$line
+		if [ ! -d /proc/$list_pid ]; then
+			continue
+		fi
+		ret=1
+		if [ -d /proc/${list_pid} ]; then
+			kill_by_pid ${list_pid}
+		fi
+	done < <(pidof ${binary} | awk '{for(i=1;i<=NF;++i){print $i}}')
+	return $ret
+}
+
+function kill_ldb_by_path()
+{
+	local binary=$1
+	local loop_flag=1
+	while [ $loop_flag -ne 0 ]
+	do
+		list_and_kill $binary
+		loop_flag=$?
+	done
+}
+
+function kill_ldb()
+{
+	kill_ldb_by_path "/ac/dc/ldb/php/sldbd"
+	kill_ldb_by_path "/ac/dc/ldb/php/sldbr"
+}
+
+function kill_sfeupdrule()
+{
+	local pro_name='sfeupdrule'
+	local pro_info=`ps -eo pid,cmd | grep -w "./$pro_name" | grep -v bash | grep -v grep`
+	if [ -z "$pro_info" ]; then 
+		local upd_ini="/run/edr_pkg_offline.ini"
+		local ioa_status=`${RWINI} -f ${upd_ini} -s ioa_ioc -k ioa_status -r`
+		local ioc_status=`${RWINI} -f ${upd_ini} -s ioa_ioc -k ioc_status -r`
+		
+		if [ "$ioa_status" -eq 1 ]; then
+			${RWINI} -f ${upd_ini} -s ioa_ioc -k ioa_status -w -v 0
+			echo "reset ioa upgrade status"
+		fi
+		
+		if [ "$ioc_status" -eq 1 ]; then
+			${RWINI} -f ${upd_ini} -s ioa_ioc -k ioc_status -w -v 0
+			echo "reset ioc upgrade status"
+		fi
+		
+		return 0
+	fi
+	echo "kill sfeupdrule"
+	kill `echo $pro_info | awk '{print $1}'`
+}
+
+function kill_P2PServer()
+{
+	local pro_name='P2PServer/bin/P2PServer'
+	local pro_info=`ps -eo pid,cmd | grep -w "./$pro_name" | grep -v bash | grep -v grep`
+	if [ -z "$pro_info" ]; then 
+		return 0
+	fi
+	echo "kill P2PServer"
+	kill `echo $pro_info | awk '{print $1}'`
+}
+
+function mask_all()
+{
+	local count=`ls ${SERVICES_PATH} | wc -l`
+	if [ $count -gt 0 ]; then
+		mv -f ${SERVICES_PATH}/* ${SERVICES_MASKED_PATH}/
+	fi
+
+	echo "mask all service success."
+	return 0
+}
+
+function mask_one()
+{
+	local service=$1
+	if [ ! -f "${SERVICES_PATH}/${service}" ]; then
+		ls $SERVICES_PATH
+		return 1
+	fi
+
+	mv -f ${SERVICES_PATH}/${service} ${SERVICES_MASKED_PATH}/
+
+	echo "mask ${service} success."
+	return 0
+}
+
+function unmask_all()
+{
+	local count=`ls ${SERVICES_MASKED_PATH} | wc -l`
+	if [ $count -gt 0 ]; then
+		mv -f ${SERVICES_MASKED_PATH}/* ${SERVICES_PATH}/
+	fi
+
+	echo "unmask all service success."
+	return 0
+}
+
+function unmask_one()
+{
+	local service=$1
+	if [ ! -f "${SERVICES_MASKED_PATH}/${service}" ]; then
+		ls $SERVICES_MASKED_PATH
+		return 0
+	fi
+
+	mv -f ${SERVICES_MASKED_PATH}/${service} ${SERVICES_PATH}/
+
+	echo "unmask ${service} success."
+	return 0
+}
+
+function mask_except_one()
+{
+	local except_service="$1"
+	while read line
+	do
+		if [ ! -f ${SERVICES_PATH}/${line} ]; then
+			continue
+		fi
+		if [ "x$line" == "x$except_service" ]; then
+			continue
+		fi
+		mv -f ${SERVICES_PATH}/${line} ${SERVICES_MASKED_PATH}/
+	done < <(ls ${SERVICES_PATH} | awk '{print $1}')
+}
+
+function stop_all()
+{
+	#创建禁用标记
+	if [ ! -d /run ]; then
+		mkdir /run
+	fi
+
+	if [ ! -f /run/edr_forbidden ]; then
+		touch /run/edr_forbidden
+	fi
+
+    # 停止MGR端的升级进程
+    if [ "$(location_of_script)" == "0" ];then
+        kill_sfeupdrule
+    fi
+	local agent_masked_flag=0
+	if [ -z "$1" ]; then
+		if [ -f $SCRIPTPATH/stop_agent_ipc.l ] && [ -f $SCRIPTPATH/../config/abs_stop_flag ]; then
+			# send stop message to manager
+			mask_except_one 0ipc_proxy
+			#等待其它消息发送完毕(主要是epinfo)
+			wait_agent_stop
+			agent_masked_flag=1
+			$SCRIPTPATH/lloader $SCRIPTPATH/stop_agent_ipc.l >/dev/null 2>&1
+			if [ $? -ne 0 ]; then
+				echo "send stop agent msg to mgr failed";
+			fi
+		fi
+	fi
+
+	rm -f $MPID_FILE
+	local mpid=`pidof_monitor`
+	if [ -n "$mpid" ]; then
+		kill $mpid
+	fi
+	
+	local mpidold=`pidof_oldmonitor`
+	if [ -n "$mpidold" ]; then
+		kill $mpidold
+	fi
+
+	if wait_moniotr_stop; then
+		sleep 1
+		if [ -x "${SCRIPTPATH}/stop_post.sh" ]; then
+			${SCRIPTPATH}/stop_post.sh
+		fi
+		kill_ldb
+		kill_P2PServer
+		if [ $agent_masked_flag -eq 1 ]; then
+			unmask_all
+		fi
+		echo "edr stop success"
+		
+		return 0
+	else
+		if [ $agent_masked_flag -eq 1 ]; then
+			unmask_all
+		fi
+        #禁用失败删除禁用标记
+        if [ -f /run/edr_forbidden ]; then
+            rm -f /run/edr_forbidden
+        fi
+		echo "edr stop failed"
+		return 1
+	fi
+}
+
+function status()
+{
+	local mpid=`pidof_monitor`
+	if [ "$mpid" == "" ]; then
+		local mpid_txt=`cat $MPID_FILE 2>/dev/null`
+		if [ -z "$mpid_txt" ]; then
+			echo "edr stopped"
+			exit 0
+		else
+			echo "edr stopped unexpectly"
+			exit 1
+		fi
+	else
+		echo "edr pid $mpid"
+		exit 0
+	fi
+}
+
+function start_one()
+{
+	local service=$1
+
+	if [ -f $SERVICES_PATH/$service ]; then
+		rm -f $SERVICES_STOPPED_PATH/$service
+	else
+		if [ -f $SERVICES_STOPPED_PATH/$service ]; then
+			touch $SERVICES_STOPPED_PATH/$service
+			mv $SERVICES_STOPPED_PATH/$service $SERVICES_PATH/
+			# wait to start XXX
+			sleep 9
+		fi
+	fi
+
+	return 0
+}
+
+function stop_one()
+{
+	local service=$1
+
+	if [ -f $SERVICES_PATH/$service ]; then
+		mv -f $SERVICES_PATH/$service $SERVICES_STOPPED_PATH/
+		# wait to stop XXX
+		sleep 9
+	fi
+
+	return 0
+}
+
+function restart_one()
+{
+	local service=$1
+
+	if [ -f $SERVICES_PATH/$service ]; then
+		touch $SERVICES_PATH/$service
+		rm -f $SERVICES_STOPPED_PATH/$service
+		# wait to restart XXX
+		sleep 9
+	else
+		start_one $service
+	fi
+
+	return 0
+}
+
+
+
+function usage()
+{
+	echo "$0 <start|stop|restart|status|mask|unmask> [service]"
+	exit 0
+}
+
+function env_check()
+{
+	if [ ! -f "$SCRIPTPATH/../lib/libssl.so.10" ];then
+		ln -s $SCRIPTPATH/../lib/libssl.so $SCRIPTPATH/../lib/libssl.so.10
+	fi
+
+	if [ ! -f "$SCRIPTPATH/../lib/libcrypto.so.10" ];then
+		ln -s $SCRIPTPATH/../lib/libcrypto.so $SCRIPTPATH/../lib/libcrypto.so.10
+	fi
+
+	if [ ! -f "$SCRIPTPATH/../lib/libfreetype.so" ] || [ ! -f "$SCRIPTPATH/../lib/libfreetype.so.6" ]; then
+		ln -s $SCRIPTPATH/../lib/libfreetype.so.6.17.1 $SCRIPTPATH/../lib/libfreetype.so > /dev/null 2>&1
+		ln -s $SCRIPTPATH/../lib/libfreetype.so.6.17.1 $SCRIPTPATH/../lib/libfreetype.so.6 > /dev/null 2>&1
+	fi
+
+	if [ ! -f "$SCRIPTPATH/../lib/libjpeg.so" ] || [ ! -f "$SCRIPTPATH/../lib/libjpeg.so.9" ]; then
+		ln -s $SCRIPTPATH/../lib/libjpeg.so.9.3.0 $SCRIPTPATH/../lib/libjpeg.so.9 > /dev/null 2>&1
+		ln -s $SCRIPTPATH/../lib/libjpeg.so.9.3.0 $SCRIPTPATH/../lib/libjpeg.so > /dev/null 2>&1
+	fi
+
+	if [ ! -f "$SCRIPTPATH/../lib/libpng16.so" ] || [ ! -f "$SCRIPTPATH/../lib/libpng16.so.16" ] || [ ! -f "$SCRIPTPATH/../lib/libpng.so" ]; then
+		ln -s $SCRIPTPATH/../lib/libpng16.so.16.37.0 $SCRIPTPATH/../lib/libpng16.so > /dev/null 2>&1
+		ln -s $SCRIPTPATH/../lib/libpng16.so.16.37.0 $SCRIPTPATH/../lib/libpng16.so.16 > /dev/null 2>&1
+		ln -s $SCRIPTPATH/../lib/libpng16.so $SCRIPTPATH/../lib/libpng.so > /dev/null 2>&1
+	fi
+}
+
+env_check
+
+case "$1" in
+	"start")
+		if [ -z "$2" ]; then
+			start_all
+		else
+			start_one $2
+		fi
+	;;
+	"stop")
+		if [ -z "$2" ]; then
+			stop_all
+		else
+			if [ "$2" == "uninstall" ]; then
+				echo "uninstall"
+				stop_all $2
+			else
+				stop_one $2
+			fi
+		fi
+	;;
+	"restart")
+		if [ -z "$2" ]; then
+			stop_all
+			sleep 1
+			start_all
+		else
+			restart_one $2
+		fi
+		;;
+	"status")
+		status
+	;;
+	"mask")
+		if [ -z "$2" ]; then
+			mask_all
+		else
+			mask_one $2
+		fi
+	;;
+	"unmask")
+		if [ -z "$2" ]; then
+			unmask_all
+		else
+			unmask_one $2
+		fi
+	;;
+	*)
+		usage
+	;;
+esac
+
+#加载led.ko内核驱动
+public_key="-----BEGIN PUBLIC KEY-----
+MIICIjANBgkqhkiG9w0BAQEFAAOCAg8AMIICCgKCAgEAt0wFDvDfdfCKsO0/hm+o
+2H7owMbwLUqkoj0hUZUM5LIBO+agmu4UcwzZPakskoZH+pWsPhOdWQyFKvDrXlOk
+W0UZbHkGQQT5L6+798gR0i5nYZFSOF3P0UB6kPAAVXzJHegvfLNsMppZD7WZSym5
+Blmy7cqpLDwy0A0zAhMS7kf4e/KfwBT1arTBr9pzSlPcCi7ZtVVbG1gI05D/OrVJ
+SzucnDwyzl8FS4k1j3iqHxTf7iqzaIo1U53La9X6xCe8hpNHhGTZ42Bx57EdDLN1
+D/qQOh4K1phSXbMuWHpMhlP8suBN/TfrEtdOhlszpoMgP6YI0cGbNq9HHivXIgUv
+NiZm5JSBbGEV9CyqbaIBrylVJYeDD19PmSIiSiy4HHntyePOG6is+d0pVdRqkF5E
+HTzSleCnw3Ho1oSGXISQ3/4pSJLv5qtwjy4Wmc1VMlaT/xvnzUALECk8QTI1GVlt
+D5mYNZmekYbiQ0uwgqSqicCBfUWthcG6lPEcMrd4S6gKcTEWWAaJaXxyWhsyyvII
+7A6OgyKIPr46i2zjqv6NlIsly0ugWPDEikIxC03HlT0Ln5Hh7MPM/pUgikcW2qPS
+c9x32NSzoxHVLCkqjyT85qZT+NuDdPZS+adyB2WWB6Qi8I9oeQ0LRwg8/Qh1k7ml
+4YotLcpOqTBb1blxTB+JGhcCAwEAAQ==
+-----END PUBLIC KEY-----"
+#加载led.ko内核驱动（制作母盘时才会加载，正常环境下没有led.ko文件，不会加载）
+led_mod=`lsmod |grep led| awk '{print $0}'`
+if [ -f $SCRIPTPATH/led.ko ] && [ "X$led_mod" == "X" ]; then
+	#验证led.ko文件sha256
+	temp_public_key_file_temp=`mktemp "XXXXXX.temp.public.key"`
+	if [ $? -ne 0 ]; then
+		echo "create temp_public_key_file_temp failed"
+		exit 1
+	fi
+	echo "${public_key}" > ${temp_public_key_file_temp}
+	led_sha256=`sha256sum $SCRIPTPATH/led.ko | awk '{ print $1 }'`
+	openssl rsautl -verify -in "$SCRIPTPATH/led_sha256.sign" -out "$SCRIPTPATH/led_sha256.verify" -inkey ${temp_public_key_file_temp} -pubin > /dev/null 2>&1
+	led_sha256_real=`cat "$SCRIPTPATH/led_sha256.verify"`
+	if [ "X${led_sha256}" == "X${led_sha256_real}" ]; then
+		insmod $SCRIPTPATH/led.ko 2>/dev/null
+		if [ $? == 0 ]; then 
+			echo "load led.ko successful"
+		fi
+	fi
+	if [ -f $SCRIPTPATH/led_sha256.verify ]; then
+		rm -f $SCRIPTPATH/led_sha256.verify
+	fi
+	if [ -f $temp_public_key_file_temp ]; then
+		rm -f $temp_public_key_file_temp
+	fi
+fi
+
+if [ $? -eq 0 ]; then
+	exit 0
+else
+	exit 1
+fi
+

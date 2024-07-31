@@ -1,0 +1,24 @@
+#!/bin/bash
+exec 2>>/dev/null
+SCRIPTPATH=$(cd $(dirname $0); pwd -P)
+INSTALLROOT="$SCRIPTPATH/../"
+LICENSE_TOOL=/ac/dc/ldb/bin/license
+
+export LD_LIBRARY_PATH="$INSTALLROOT/lib"
+$SCRIPTPATH/lloader <<EOF
+local ini = require "ini"
+local fs = require "fs"
+
+local version = "Version: (MGR/CLD-related)"
+local verconf = ini.load(fs.pathTransform("@/../config/version"))
+if verconf then
+	version = verconf:get("version", "main")
+end
+
+print("EDR " .. version)
+
+EOF
+echo "Host ID - "`${LICENSE_TOOL} gethostid`
+BBC_VERSION=`find ./scl -name *.dev`
+echo "BBC ${BBC_VERSION##*/}"
+

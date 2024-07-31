@@ -1,0 +1,10 @@
+#!/bin/bash
+
+SCRIPTPATH=$(cd $(dirname $0); pwd -P)
+export LD_LIBRARY_PATH=$SCRIPTPATH/../lib
+
+if [ -f /tmp/eps_debug ]; then
+	$SCRIPTPATH/lloader $SCRIPTPATH/iptables.l $*
+else
+	$SCRIPTPATH/lloader $SCRIPTPATH/iptables.l $* 2>/dev/null
+fi

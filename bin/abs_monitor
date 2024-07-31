@@ -1,0 +1,50 @@
+#!/bin/bash
+
+SCRIPTS_PATH=$(cd $(dirname $0); pwd -P)
+
+if [ -f $SCRIPTS_PATH/abs_deployd ]; then
+	SERVICE_PATH=$SCRIPTS_PATH/abs_deployd
+else
+	SERVICE_PATH=$SCRIPTS_PATH/abs_deployer
+fi
+
+test -f $SERVICE_PATH || exit 0
+
+# singleton exec
+LOCK_FILE=${0}.lock
+
+[ -f $LOCK_FILE ] || touch $LOCK_FILE
+exec 9<> $LOCK_FILE
+flock -no 9 || exit 0
+
+trap "rm -f $LOCK_FILE" EXIT
+
+$SERVICE_PATH 9>&- &
+
+SERVICE_OLD_MD5=`md5sum $SERVICE_PATH`
+MONITOR_OLD_MD5=`md5sum $0`
+
+while true; do
+	sleep 5
+
+	test -f $SERVICE_PATH || exit 0
+	test -f $0 || exit 0
+
+	SERVICE_NEW_MD5=`md5sum $SERVICE_PATH`
+	if [ "$SERVICE_NEW_MD5" != "$SERVICE_OLD_MD5" ]; then
+		echo "service file changed"
+		break
+	fi
+
+	MONITOR_NEW_MD5=`md5sum $0`
+	if [ "$MONITOR_NEW_MD5" != "$MONITOR_OLD_MD5" ]; then
+		echo "monitor file changed"
+		break
+	fi
+
+	SERVICE_JOB_COUNT=`jobs -r | wc -l`
+	if [ $SERVICE_JOB_COUNT -ne 1 ]; then
+		echo "service stopped"
+		$SERVICE_PATH 9>&- &
+	fi
+done

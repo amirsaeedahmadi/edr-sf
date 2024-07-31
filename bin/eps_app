@@ -1,0 +1,8 @@
+#!/bin/bash
+
+SCRIPTPATH=$(cd $(dirname $0); pwd -P)
+
+export LD_LIBRARY_PATH=$SCRIPTPATH/../lib
+export LOG_CONSOLE=1
+
+$SCRIPTPATH/edr_monitor -app

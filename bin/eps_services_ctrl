@@ -1,0 +1,47 @@
+#!/bin/bash
+
+SCRIPTS_PATH=$(cd $(dirname $0); pwd -P)
+EPSCTRL_FILE=$SCRIPTS_PATH/../var/eps_ctrl
+
+mkdir -p $SCRIPTS_PATH/../var
+
+if [ -n "$1" ]; then
+	echo "$1" > $EPSCTRL_FILE
+	exit 0
+fi
+
+# singleton exec
+LOCK_FILE=${0}.lock
+
+test -f $LOCK_FILE || touch $LOCK_FILE
+exec 9<> $LOCK_FILE
+flock -no 9 || exit 0
+
+trap "rm -f $EPSCTRL_FILE $LOCK_FILE" EXIT
+
+test -f $EPSCTRL_FILE || mkfifo $EPSCTRL_FILE
+exec 10<>$EPSCTRL_FILE
+
+MY_OLD_MD5=`md5sum $0`
+
+while true; do
+	if read -t 10 -u 10 line; then
+		echo "$line"
+		if [ "$line" != "restart" -a "$line" != "start" -a "$line" != "stop" ]; then
+			exit 0
+		fi
+		$SCRIPTS_PATH/eps_services "$line" 10>&- 9>&-
+		break
+	else
+		echo "read timeout"
+		test -f ${0} || exit 0
+		test -e ${EPSCTRL_FILE} || exit 0
+
+		MY_NEW_MD5=`md5sum $0`
+		if [ "$MY_NEW_MD5" != "$MY_OLD_MD5" ]; then
+			echo "file changed"
+			break
+		fi
+	fi
+done
+

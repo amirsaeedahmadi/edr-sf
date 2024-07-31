@@ -1,0 +1,778 @@
+#!/bin/bash
+
+MODULE_NAME="global"
+SCRIPT_MODULE="post_${MODULE_NAME}"
+INSTALL_CROND_AGENT="/etc/cron.d/edr_agent"
+INSTALL_MSS_CROND_AGENT="/etc/cron.d/cssp_agent"
+OLD_DEF_INSTALL_PATH="/sf/edr/agent"
+NEW_DEF_INSTALL_PATH="/sangfor/edr/agent"
+
+MONITROR_EXE="edr_monitor"
+SERVICE_NAME="eps_services"
+SERVICE_NAME_CTRL="eps_services_ctrl"	
+SERVICE_NAME_CHECK_SH="eps_services_check.sh"	
+
+RESTART_EPS_MONITOTR_FLAG="/tmp/edr_restart_monitor_flag"
+
+
+#log dir
+g_szLogDir="var/log/sfupdate"
+g_szLogFileName="script.txt"
+g_szLogFile="$g_szLogDir/$g_szLogFileName"
+
+
+function write_log() 
+{
+	local dateTime; dateTime=$(date "+%Y/%m/%d %H:%M:%S")
+	g_szLogFile="$g_szLogDir/$g_szLogFileName"
+	 
+	if [ ! -d ${g_szLogDir} ]; then
+		mkdir -p "${g_szLogDir}" 2>&1 > /dev/null
+		if [ $? -eq 0 ]; then
+			echo [$1][$dateTime][${SCRIPT_MODULE}]create dir ${g_szLogDir} successfully 2>&1 >> "${g_szLogFile}"		 
+		else
+			g_szLogFile="$g_szLogFileName"
+			echo [$1][$dateTime][${SCRIPT_MODULE}]create dir ${g_szLogDir} failed 2>&1 >> "${g_szLogFile}"
+		fi
+	fi
+
+	echo [$1][$dateTime][${SCRIPT_MODULE}]"${2}" 2>&1 >> "${g_szLogFile}"
+}
+
+function get_agent_dir_from_crond()
+{
+	local crond_file="$1"
+	if [ -f $crond_file ]; then
+		awk '{print $7}' $crond_file | awk -F 'bin/eps_services_check' '{print $1}'
+	else
+		echo -n ""
+	fi
+}
+
+function get_agent_running_dir()
+{
+	local szRunningDir=""
+	szRunningDir=`ps -ef | grep -v grep | grep ${MONITROR_EXE} | awk '{print $8}'`
+	if [ "${szRunningDir}" != "" ];then
+		szRunningDir="${szRunningDir//bin\/$MONITROR_EXE/}"
+		echo "${szRunningDir}"
+	else
+		echo -n ""
+	fi
+}
+
+function get_install_dir()
+{
+	local _szInstallDir="$1"
+	local _uLen=`expr ${#_szInstallDir} - 1`
+	local _cslash="${_szInstallDir:$_uLen:1}"
+	
+	if [ "${_cslash}" == "/" ];then
+		echo "${_szInstallDir}"
+	else
+		echo "${_szInstallDir}/"
+	fi
+}
+
+#delete useless services and switch-off services
+#param $1 => szInstallDir
+#return if succeed return 0 else return 1
+function delete_subservices()
+{
+	local szInstallDir="${1}"
+	local srv_name="${szInstallDir}services/agent_info"
+	local srv_execfile="${szInstallDir}lmodules/collect_agent_info.lua"
+	local log_folder="${szInstallDir}var/log/collect_agent_info"
+	#agent_info
+	if [ -f $srv_name ]; then
+		rm -f $srv_name
+		if [ -f $srv_execfile ]; then
+			rm -f $srv_execfile
+		fi
+	fi
+	if [ -d $log_folder ]; then
+		rm -rf $log_folder
+	fi
+	#eps_cron
+	srv_name="${szInstallDir}services/eps_cron"
+	srv_execfile="${szInstallDir}lmodules/eps_cron.lua"
+	log_folder="${szInstallDir}var/log/eps_cron"
+	if [ -f $srv_name ]; then
+		rm -f $srv_name
+		if [ -f $srv_execfile ]; then
+			rm -f $srv_execfile
+		fi
+	fi
+	if [ -d $log_folder ]; then
+		rm -rf $log_folder
+	fi
+
+	#flux_app
+	srv_name="${szInstallDir}services/30flux_app"
+	local srv_back_name="${szInstallDir}servicesb/30flux_app"
+	if [[ -f $srv_back_name && -f $srv_name ]]; then
+		rm -f $srv_name
+	fi
+	return 0
+}
+
+#set rsyslogd config
+#param $1 => szInstallDir
+#return if succeed return 0 else return 1
+function set_syslog()
+{
+	local szInstallDir="${1}"
+	local syslogName="rsyslogd"
+	local setsyslog_flag=1
+	local szFilePath=""
+	which $syslogName > /dev/null 2>&1 && ps -A | grep $syslogName > /dev/null
+	if [ $? -ne 0 ];then
+		syslogName="syslogd"
+		which $syslogName > /dev/null 2>&1 && ps -A | grep $syslogName > /dev/null
+		if [ $? -ne 0 ];then
+			setsyslog_flag=0
+		fi
+	fi
+	
+	szFilePath="${szInstallDir}bin/setsyslog"
+	if [ $setsyslog_flag -eq 1 ];then
+		if [ ! -f "${szFilePath}" ];then
+			write_log "warn" "${szFilePath} not exist"
+			return 1
+		else
+			$szFilePath -i
+			if [ $? -ne 0 ];then
+				write_log "warn" "${szFilePath},set iptables system log fail"
+				return 1
+			fi
+		fi
+	fi
+	
+	return 0
+}
+
+#start eps_monitor
+#param $1 => szInstallDir
+#return if succeed return 0 else return 1
+function start_eps_monitor()
+{
+	local szInstallDir="${1}"
+	local szServicePath=""
+	if [ ! -d "${szInstallDir}" ];then
+		write_log "warn" "${szInstallDir} not exist"
+		return 1
+	fi
+	
+	szServicePath="${szInstallDir}bin/${SERVICE_NAME_CTRL}"
+	if [ ! -f "${szServicePath}" ];then
+		write_log "warn" "${szServicePath} not exist"
+		szServicePath="${szInstallDir}bin/${SERVICE_NAME}"
+		if [ ! -f "${szServicePath}" ];then
+			write_log "warn" "${szServicePath} not exist"
+			return 1
+		fi
+	fi
+	
+	
+	start_abs_monitor "${szInstallDir}"
+	chmod +x "${szServicePath}" >/dev/null
+	if [ ! -f "${RESTART_EPS_MONITOTR_FLAG}" ] ;then
+		write_log "info" "run ${szServicePath} \"start\""
+		${szServicePath} "start" >/dev/null
+		if [ $? -ne 0 ];then
+			write_log "warn" "${szServicePath} \"start\" failed"
+			return 1
+		fi
+		write_log "info" "${szServicePath} \"start\" successfully"
+	else
+		write_log "info" "run ${szServicePath} \"restart\""
+		${szServicePath} "restart" >/dev/null
+		if [ $? -ne 0 ];then
+			write_log "warn" "${szServicePath} \"restart\" failed"
+			return 1
+		fi
+		rm -f "${RESTART_EPS_MONITOTR_FLAG}"
+		write_log "info" "${szServicePath} \"restart\" successfully"
+	fi
+
+	return 0
+}
+
+#stop eps_monitor
+#param $1 => szInstallDir
+#return if succeed return 0 else return 1
+function stop_eps_monitor()
+{
+	local uEpsMonitorID=0
+	local szInstallDir="${1}"
+	local szServicePath=""
+	if [ ! -d "${szInstallDir}" ];then
+		write_log "warn" "${szInstallDir} not exist"
+		return 1
+	fi
+	
+	szServicePath="${szInstallDir}bin/${SERVICE_NAME}"
+	if [ ! -f "${szServicePath}" ];then
+		write_log "warn" "${szServicePath} not exist"
+		return 1
+	fi
+	
+	write_log "info" "run ${szServicePath} \"stop\""
+	
+	chmod +x "${szServicePath}" >/dev/null
+	${szServicePath} "stop" >/dev/null
+	
+	if [ $? -ne 0 ];then
+		write_log "warn" "${szServicePath} \"stop\" failed"
+		return 1
+	fi
+	
+	#kill old eps_monitor when stop failed
+	uEpsMonitorID=`ps -ef |grep -v grep|  grep bin/edr_monitor | awk '{printf FS $2}'` 
+	if [ "${uEpsMonitorID}" != "" ];then
+		kill -9 ${uEpsMonitorID} 2>&1 > /dev/null
+		if [ $? -ne 0 ];then
+			write_log "warn" "kill edr_monitor pid(${uEpsMonitorID}) failed"
+			return 1
+		fi
+	fi
+	
+	write_log "info" "${szServicePath} \"stop\" successfully"
+	return 0
+}
+
+#write new path to /etc/cron.d/edr_agent
+#param $1 => szNewInstallDir
+#return if succeed return 0 else return 1
+function write_crond()
+{
+	local szNewIntallDir="${1}"
+	local szAgentDirFromCrond=""
+	
+	szAgentDirFromCrond=`get_agent_dir_from_crond $INSTALL_CROND_AGENT`
+	if [ "${szAgentDirFromCrond}" == "${szNewIntallDir}" ];then
+		write_log "info" "/etc/crond.d/eps_agent not need change"
+		return 0
+	else
+		echo "* * * * * root ${szNewIntallDir}bin/eps_services_check.sh > /dev/null 2>&1" >"${INSTALL_CROND_AGENT}"
+		if [ $? -ne 0 ];then
+			write_log "warn" "update ${INSTALL_CROND_AGENT} failed"
+			return 1
+		fi
+		write_log "info" "update ${INSTALL_CROND_AGENT} successfully"
+		return 0
+	fi
+}
+
+#install new eps_monitor
+#param $1 => szInstallDir
+#param $2 => bRemoveDir	 1:rmdir 0:not rmdir
+#return if succeed return 0 else return 1
+function uninstall_eps_monitor()
+{
+	local szInstallDir="${1}"
+	local szRemove="${2}"
+	
+	stop_eps_monitor "${szInstallDir}"
+	if [ $? -ne 0 ];then
+		write_log "warn" "stop_eps_monitor ${szInstallDir} failed"
+		return 1
+	fi
+	write_log "info" "stop_eps_monitor ${szInstallDir} successfully"
+	
+	delete_mss_old_file
+	if [ $? -ne 0 ];then
+		write_log "warn" "delete mss old failed"
+		exit -1
+	fi
+
+	if [ "${szRemove}" == "0" ];then
+		return 0
+	fi
+	
+	rm -rf "${szInstallDir}" >/dev/null
+	if [ $? -ne 0 ];then
+		write_log "warn" "rm -rf ${szInstallDir} failed"
+		return 1
+	fi
+	
+	write_log "info" "rm -rf ${szInstallDir} successfully"
+	return 0
+}
+
+#copy file
+#param $1 => szSrcFile
+#param $2 => szDstFile
+#param $3 => szOverWrite if it's 0 not overwrite else overwrite
+function CopyFile()
+{
+	local szSrcFile="${1}"
+	local szDstFile="${2}"
+	local bOverWrite=${3}
+	if [ ! -f "${szSrcFile}" ];then
+		write_log "warn" "file:${szSrcFile} not found"
+		return 1
+	fi
+
+	if [ ${bOverWrite} -ne 0 ]; then
+		cp -f "${szSrcFile}" "${szDstFile}" >/dev/null
+	else
+		if [ -f "${szDstFile}" ]; then
+			return ;
+		fi
+		cp -f "${szSrcFile}" "${szDstFile}" >/dev/null
+	fi
+
+	return 0
+}
+
+#start_abs_monitor
+#return if succeed return 0
+function start_abs_monitor()
+{
+	local szInstallDir="${1}"
+	local szAbsLock="${szInstallDir}bin/abs_monitor.lock"
+	if [ -f "${szAbsLock}" ];then
+		write_log "info" " abs_monitor already start"
+	else
+		"${szInstallDir}bin/eps_services_check.sh" </dev/null >/dev/null 2>&1 &
+		write_log "info" "eps_services_check execute"
+	fi
+	return 0
+}
+
+#install new eps_monitor
+#param $1 => szInstallDir
+#return if succeed return 0 else return 1
+function install_eps_monitor()
+{
+	local szInstallDir="${1}"
+	local szMgrAddr="${2}"
+	local szVerType="${3}"
+	local szUid="${4}"
+	local szServerIni="${szInstallDir}config/server.ini"
+	local uUpdateMgrPID=""
+
+	if [ "${szMgrAddr}" == "" ];then
+		write_log "warn" "invalid server addr, server ini no exist"
+		return 1
+	fi
+
+	#TD2022032600414 先写server.ini，防止cron定时任务拉起时，发现没有server.ini会导致计算agent_id崩溃
+	if [ "${szVerType}" != "2" ];then
+		echo "[config]" > "${szServerIni}"
+		echo "addr = ${szMgrAddr}" >> "${szServerIni}"
+		if [ -z "${szUid}" ];then
+			write_log "info" "create ${szServerIni} successful,  addr = ${szMgrAddr}"
+		else
+			echo "uid = ${szUid}" >> "${szServerIni}"
+			write_log "info" "create ${szServerIni} successful,  addr = ${szMgrAddr}, uid = ${szUid}"
+		fi
+	fi
+	write_log "info" "curr upgrade type ${szVerType}"
+
+	write_log "info" "szUid is ${szUid}"
+
+	CopyFile "${szInstallDir}config/default/disable_ipv6" "${szInstallDir}config/disable_ipv6" 0
+	CopyFile "${szInstallDir}config/default/exclude_file.ini" "${szInstallDir}config/exclude_file.ini" 0
+	CopyFile "${szInstallDir}config/default/mi_white.conf" "${szInstallDir}config/mi_white.conf" 0
+	CopyFile "${szInstallDir}config/default/flux_view.conf" "${szInstallDir}config/flux_view.conf" 0
+	CopyFile "${szInstallDir}config/default/res_limit.ini" "${szInstallDir}config/res_limit.ini" 0
+
+	set_syslog "${szInstallDir}"
+	if [ $? -ne 0 ];then
+		write_log "warn" "set_syslog failed"
+	fi
+
+	delete_subservices "${szInstallDir}"
+	if [ $? -ne 0 ];then
+		write_log "warn" "delete_subservices failed"
+	fi
+
+	start_eps_monitor "${szInstallDir}"
+	if [ $? -ne 0 ];then
+		write_log "warn" "start_eps_monitor failed"
+		return 1
+	fi
+	
+	write_log "info" "start_eps_monitor successfully"
+
+	#restart sfUpdateMgr
+	if [ -f /tmp/edr_upgrade_flag ]; then
+		uUpdateMgrPID=`ps -ef |grep -v grep|  grep bin/sfupdatemgr | awk '{printf FS $2}'` 
+		
+		#存在sfupdatermgr进程
+		if [ "${uUpdateMgrPID}" != "" ];then
+			kill -9 ${uUpdateMgrPID} 2>&1 > /dev/null
+			if [ $? -ne 0 ];then
+				write_log "warn" "kill sfupdatemgr pid(${uUpdateMgrPID}) failed"
+			else
+				write_log "info" "kill sfupdatemgr pid(${uUpdateMgrPID}) successfully"
+			fi
+		fi
+		
+		#rm file_flag
+		rm -f /tmp/edr_upgrade_flag
+	fi
+
+	return 0
+}
+
+#兼容MSS升级，删除MSS老版本残留文件
+function delete_mss_old_file()
+{
+	local ret=0
+	local count=3
+	local mss_old_srv_name="/etc/cron.d/cssp_agent"
+	local mss_old_folder=""
+
+	write_log "info" "begin to delete_mss_old_file>>>>>>>>>"
+	if [ -f ${mss_old_srv_name} ]; then
+		#获取mss安装路径
+		mss_old_folder=$(awk '{print $7}' ${mss_old_srv_name} | awk -F 'bin/eps_services_check' '{print $1}')
+
+		for (( i = 0; i < $count; i++ ))
+		do
+			rm -f ${mss_old_srv_name} >/dev/null
+			if [ -f ${mss_old_srv_name} ]; then
+				ret=1
+				write_log "warn" "del mss old file ${mss_old_srv_name} failed try $count"
+			else
+				ret=0
+				write_log "info" "del mss old file ${mss_old_srv_name} successfully"
+				break
+			fi
+			sleep 2
+		done
+	fi
+
+	if [ $ret -ne 0 ];then
+		write_log "warn" "del mss old file ${mss_old_srv_name} failed"
+		return 1
+	fi
+
+	if [ "${mss_old_folder}" != "" ] && [ -d ${mss_old_folder} ]; then
+		for (( i = 0; i < $count; i++ ))
+		do
+			rm -rf ${mss_old_folder} >/dev/null
+			if [ -d ${mss_old_folder} ]; then
+				ret=1
+				write_log "warn" "del mss old file ${mss_old_folder} failed try $count"
+			else
+				ret=0
+				write_log "info" "del mss old file ${mss_old_folder} successfully"
+				break
+			fi
+			sleep 2
+		done
+	fi
+
+	if [ $ret -ne 0 ];then
+		write_log "warn" "del mss old file ${mss_old_folder} failed"
+	fi
+
+	return 0
+}
+
+function cleanup_package_dir()
+{
+	local install_dir=$1
+
+	if [[ ! -n "${install_dir}" || ! -d "${install_dir}/packages" ]]; then
+		write_log "warn" "package dir not exist"
+		return 1
+	fi
+
+	write_log "info" "start rm ${szInstallDir}/packages"
+	rm -rf ${install_dir}/packages
+	if [ $? != 0 ]; then
+		write_log "warn" "rm package dir failed"
+		return 1
+	fi
+
+	return 0
+}
+
+function cleanup_lite_useless_file()
+{
+	local install_dir=$1
+	write_log "info" "start rm cleanup_lite_useless_file"
+	
+	if [[ -f "${install_dir}/agent_scripts/anti_bfa_sshd.lua" ]]; then
+		write_log "warn" "start rm anti_bfa_sshd.lua"
+		rm -f ${install_dir}/agent_scripts/anti_bfa_sshd.lua
+		if [ $? != 0 ]; then
+			write_log "warn" "rm anti_bfa_sshd.lua failed"
+		fi
+	fi
+	if [[ -f "${install_dir}/agent_scripts/savlog.lua" ]]; then
+		write_log "warn" "start rm savlog.lua"
+		rm -f ${install_dir}/agent_scripts/savlog.lua
+		if [ $? != 0 ]; then
+			write_log "warn" "rm savlog.lua failed"
+		fi
+	fi
+
+	if [[ -f "${install_dir}/config/abfsTimeNumber.ini" ]]; then
+		write_log "warn" "start rm abfsTimeNumber.ini"
+		rm -f ${install_dir}/config/abfsTimeNumber.ini
+		if [ $? != 0 ]; then
+			write_log "warn" "rm abfsTimeNumber.ini failed"
+		fi
+	fi
+	
+	if [[ -n "${install_dir}" && -d "${install_dir}/lualibs/anti_bfa_sshd" ]]; then
+		write_log "warn" "start rm lualibs anti_bfa_sshd"
+		rm -rf ${install_dir}/lualibs/anti_bfa_sshd
+		if [ $? != 0 ]; then
+			write_log "warn" "rm lualibs anti_bfa_sshd failed"
+		fi
+	fi
+	return 0
+}
+
+function cleanup_avira_engine_useless_file()
+{
+	local install_dir=$1
+	write_log "info" "start rm cleanup_avira_engine_useless_file"
+	
+	#删除avira同目录下一些没用的文件
+	rm -f ${install_dir}/engine/avira/*AV-malware-names-* >/dev/null
+	rm -f ${install_dir}/engine/avira/bin/*savapi* >/dev/null
+	rm -f ${install_dir}/engine/avira/bin/*avupdate* >/dev/null
+	rm -f ${install_dir}/engine/avira/bin/*_example* >/dev/null
+	rm -f ${install_dir}/engine/avira/bin/*.sh >/dev/null
+	rm -f ${install_dir}/engine/avira/bin/*.conf >/dev/null
+	rm -f ${install_dir}/engine/avira/bin/avlinfo >/dev/null
+	rm -f ${install_dir}/engine/avira/bin/avverifier >/dev/null
+	
+	return 0
+}
+
+function main()
+{
+	local szInstallDir=""
+	local szOldInstallDir=""
+	local szCurRunningDir=""
+	local bExitCrond=false
+	local szMgrAddr=""
+	local szOldDirArr=()
+	local verType="1"
+	local szExeFile=""
+	local environment=""
+	local szUid=""
+	
+	if [ ! -n "${1}" ]; then
+		echo "invalid parameters"
+		echo "first param must be directory"
+		return -1
+	fi
+	
+	szMgrAddr="${2}"
+	verType="${3}"
+	szUid="${4}"
+	
+
+	szInstallDir=`get_install_dir "${1}"`
+	g_szLogDir="${szInstallDir}${g_szLogDir}"
+	
+	write_log "info" "install path is ${szInstallDir}"
+	
+	cleanup_avira_engine_useless_file ${szInstallDir}
+	
+	#判断终端是否是lite版本
+	local agent_type=`${szInstallDir}bin/lloader ${szInstallDir}bin/get_agent_info.l ${szInstallDir} "get_agent_type"`
+	write_log "info" "agent type res : ${agent_type}"
+	
+	#lite版无病毒库和隔离区
+	if [ "${agent_type}" != "1" ];then
+		# 病毒库更新后，重启一下杀毒服务
+		write_log "info" "Begin to exec (${szInstallDir}/bin/eps_services restart 30sfavsrv)"
+		${szInstallDir}/bin/eps_services restart 30sfavsrv
+		write_log "info" "End to exec (${szInstallDir}/bin/eps_services restart 30sfavsrv)"
+		
+		#328升级329之后，将隔离区中的未加密隔离文件进行加密
+		szExeFile="${szInstallDir}bin/sf_isolate_encry"
+		if [ -f "$szExeFile" ];then
+			write_log "info" "begin to exec ${szExeFile} to encry isolate files."
+			
+			environment=$LD_LIBRARY_PATH
+			export LD_LIBRARY_PATH=${szInstallDir}/lib
+			$szExeFile  2>&1 > /dev/null
+			export LD_LIBRARY_PATH=$environment
+			
+			if [ $? -ne 0 ];then
+				write_log "warn" "exec ${szExeFile} failed"
+			fi
+		else
+			write_log "warn" "${szExeFile} is not exist."
+		fi
+	else
+		cleanup_lite_useless_file ${szInstallDir}
+	fi
+	
+	crond_file="$INSTALL_CROND_AGENT"
+	if [ -f "$INSTALL_CROND_AGENT" ];then
+		bExitCrond=true
+		szOldInstallDir=`get_agent_dir_from_crond $INSTALL_CROND_AGENT`
+		write_log "info" "file ${INSTALL_CROND_AGENT} exist"
+	fi
+
+	if [ -f "$INSTALL_MSS_CROND_AGENT" ];then
+		bExitCrond=true
+		crond_file="$INSTALL_MSS_CROND_AGENT"
+		szOldInstallDir=`get_agent_dir_from_crond $INSTALL_MSS_CROND_AGENT`
+		write_log "info" "file ${INSTALL_MSS_CROND_AGENT} exist"
+	fi
+
+	# /etc/cron.d/edr_agent exist
+	if [ "${bExitCrond}" == "true" ];then
+		# install dir from /etc/cron.d/edr_agent not exist
+		if [ ! -d "${szOldInstallDir}" ];then
+		
+			write_log "warn" "file ${crond_file} exist but install dir ${szOldInstallDir} not exist"
+			
+			# install dir from running eps_monitor
+			szCurRunningDir=`get_agent_running_dir`
+			if [ "${szCurRunningDir}" == "" ];then
+				install_eps_monitor "${szInstallDir}" "${szMgrAddr}" "${verType}" "${szUid}"
+				if [ $? -ne 0 ];then
+					write_log "warn" "install_eps_monitor failed, exit -1"
+					cleanup_package_dir ${szInstallDir}
+					return -1
+				fi
+				
+				write_log "info" "install_eps_monitor successfully, exit 0"
+				cleanup_package_dir ${szInstallDir}
+				return 0
+			fi
+			szOldInstallDir="${szCurRunningDir}"
+		else
+		# install dir from /etc/cron.d/edr_agent exist
+			write_log "info" "crond install dir:${szOldInstallDir} exist"
+		fi
+		
+		if [ "${szOldInstallDir}" == "${szInstallDir}" ];then
+		
+			write_log "info" "crond dir \"${szOldInstallDir}\" == install dir:\"${szInstallDir}\""
+			
+			install_eps_monitor "${szInstallDir}" "${szMgrAddr}" "${verType}" "${szUid}"
+			
+			if [ $? -ne 0 ];then
+				write_log "warn" "install_eps_monitor \"${szInstallDir}\" failed, exit -1"
+				cleanup_package_dir ${szInstallDir}
+				return -1
+			fi
+			
+			write_log "info" "install_eps_monitor \"${szInstallDir}\" successfully, exit 0"
+			cleanup_package_dir ${szInstallDir}
+			return 0
+		fi
+		
+		if [ "${szCurRunningDir}" == "" ];then
+			write_log "info" "crond dir \"${szOldInstallDir}\" != current install dir:\"${szInstallDir}\""
+		else
+			write_log "info" "running eps_monitor install dir \"${szOldInstallDir}\" != current install dir:\"${szInstallDir}\""
+		fi
+	else	
+	# /etc/cron.d/edr_agent not exist
+		write_log "warn" "$INSTALL_CROND_AGENT not exist"
+		szCurRunningDir=`get_agent_running_dir`
+		if [ "${szCurRunningDir}" != "" ];then
+			write_log "warn" "${szCurRunningDir}bin/edr_monitor running now"
+			szOldInstallDir="${szCurRunningDir}"
+		fi
+	fi
+	
+	#to process multi eps_monitor process phenomenon
+	if [ "${szOldInstallDir}" != "" ];then
+		szOldDirArr=(${szOldInstallDir})
+		for szTmpDir in ${szOldDirArr[@]}
+		do
+			szOldInstallDir=${szTmpDir}
+			#
+			#user define path:	stop old eps_monitor,not remove dir
+			#old style path:	stop old eps_monitor,remove dir
+			#new style path but not equal current install dir: stop old eps_monitor,remove dir
+			#
+			write_log "info" "curr install path ${szInstallDir}, old install path ${szOldInstallDir}"
+			if [ -d "${szOldInstallDir}" -a "${szOldInstallDir}" != "${szInstallDir}" ];then
+				local szHasOldFlag=""
+				local szOldServerIni=""
+				local szNewServerIni=""
+				szHasOldFlag=`echo "${szOldInstallDir}" | grep "${OLD_DEF_INSTALL_PATH}"`
+				
+				szOldServerIni="${szOldInstallDir}config/server.ini"
+				szNewServerIni="${szInstallDir}config/server.ini"
+
+				mkdir -p "${szInstallDir}config/" 2>&1 >/dev/null
+				
+				if [ -f "${szOldServerIni}" ];then
+					write_log "info" "backup old ${szOldServerIni} to ${szNewServerIni}"
+					mv -f "${szOldServerIni}" "${szNewServerIni}" 2>&1 >/dev/null
+				fi
+
+				if [ "${szHasOldFlag}" != "" ];then
+						write_log "info" "crond dir is old style install path:${szOldInstallDir}"
+						write_log "info" "uninstall old edr_monitor ${szOldInstallDir} and remove it"
+						
+						rm -f "${szOldInstallDir}bin/${SERVICE_NAME_CHECK_SH}" >/dev/null
+						uninstall_eps_monitor "${szOldInstallDir}" "1"
+				else
+				
+					szHasOldFlag=`echo "${szOldInstallDir}" | grep "${NEW_DEF_INSTALL_PATH}"`
+					if [ "${szHasOldFlag}" != "" ];then
+						write_log "info" "uninstall old edr_monitor ${szOldInstallDir} \"removedir\"."
+						uninstall_eps_monitor "${szOldInstallDir}" "1"
+					else
+						rm -f "${szOldInstallDir}bin/${SERVICE_NAME_CHECK_SH}" >/dev/null
+						write_log "info" "uninstall old edr monitor ${szOldInstallDir} \"no remove dir (user define path)\""
+						uninstall_eps_monitor "${szOldInstallDir}" "0"
+					fi
+				fi
+
+			fi
+		done
+	fi
+
+	#
+	#install new eps_monitor and wirte crond
+	#start eps_monitor
+	#
+	install_eps_monitor "${szInstallDir}" "${szMgrAddr}" "${verType}" "${szUid}"
+	if [ $? -ne 0 ];then
+		write_log "warn" "install_eps_monitor \"${szInstallDir}\" failed, exit -1>"
+		cleanup_package_dir ${szInstallDir}
+		return -1
+	fi
+
+	#abs_deployer和monitor拉起对应服务，云内升版本检测机制要求5s内需要拉起程序
+	sleep 5
+	#删除mss老文件
+	delete_mss_old_file
+	if [ $? -ne 0 ];then
+		write_log "warn" "delete mss old failed"
+		cleanup_package_dir ${szInstallDir}
+		return -1
+	fi
+	
+	cleanup_package_dir ${szInstallDir}
+	
+	write_log "info" "install_eps_monitor \"${szInstallDir}\" successfully"
+	
+	return 0	
+}
+
+main "$@"
+
+if [ "$?" == "0" ];then
+	szInstallDir=`get_install_dir "${1}"`
+	write_crond "${szInstallDir}"
+	if [ $? -ne 0 ];then
+		write_log "warn" "write_crond failed"
+		exit 1
+	fi
+	exit 0
+else
+	exit -1
+fi

@@ -1,0 +1,297 @@
+#!/bin/bash
+#	完成以下任务:
+#	1.在/etc/syslog.conf或者/etc/rsyslog.conf中设置开启iptables的日志
+#	2.在/etc/logrotate.conf中设置对iptables日志的清理工作
+#	3.卸载时候的配置还原
+#
+#   ***Note:
+#		*安装脚本应该调用本脚本，本脚本放置在bin目录。脚本运行日志在/var/log中。
+#		*卸载脚本应该调用本脚本完成卸载工作
+#		*脚本会向stdin输入关键的信息，调用者可以重定向掉
+#		*执行成功返回0，失败返回其他
+#	***Other:
+# 		*获取syslog或者rsyslog的配置文件路径，如系统同时有syslog和rsyslog，
+# 		 则使用性能更高的rsyslog.
+
+# 要求必须给出一个参数: -i:安装 或者 -u:卸载
+if [ $# != 1 ]; then
+	echo "Usage: setsyslog [-i|-u]"
+	echo "       -i: install"
+	echo "       -u: uninstall"
+	exit 1
+else
+	model=$1
+fi
+
+# 日志文件路径
+logfile="/var/log/setsyslog.log"
+if [ ! -f $logfile ]; then
+	touch $logfile 2>/dev/null || (echo "touch $logfile failed"; exit 1)
+fi
+
+# 参数是待记录的日志
+function error() {
+	echo "[error] $(date): $*"
+	echo "[error] $(date): $*" >> $logfile
+	exit 1
+}
+
+function info() {
+	echo "[info] $(date): $*"
+	echo "[info] $(date): $*" >> $logfile
+}
+
+# 默认路径
+#syslogd_def_cmd="which syslogd > /dev/null 2>&1 && ps -A | grep syslogd > /dev/null"
+syslogd_conf_def_path="/etc/syslog.conf"
+syslogd_srv_cmd="service syslog restart"
+
+#rsyslogd_def_cmd="which rsyslogd > /dev/null 2>&1 && ps -A | grep rsyslogd > /dev/null"
+rsyslogd_conf_def_path="/etc/rsyslog.conf"
+rsyslogd_srv_cmd="service rsyslog restart"
+
+#rcsyslog_def_cmd="which syslog-ng > /dev/null 2>&1 && ps -A | grep syslog-ng > /dev/null"
+rcsyslog_conf_def_path="/etc/syslog-ng/syslog-ng.conf"
+rcsyslog_bak_conf_path="/etc/syslog-ng/sangfor_bak_syslog-ng"
+rcsyslog_srv_cmd="rcsyslog restart"
+
+# 实际路径，默认使用rsyslog
+#logd_test=$rsyslogd_def_cmd
+logconf_path=$rsyslogd_conf_def_path
+logsrv_cmd=$rsyslogd_srv_cmd
+
+# 如果默认的实际路径不存在则使用syslog: 安装和卸载的规则相同
+#$logd_test > /dev/null 2>&1
+which rsyslogd > /dev/null && ps -A | grep rsyslogd > /dev/null
+if [ $? != 0 ]; then
+	which syslogd > /dev/null && ps -A | grep syslogd > /dev/null
+	if [ $? != 0 ]; then
+		which syslog-ng > /dev/null && ps -A | grep syslog-ng > /dev/null
+		if [ $? != 0 ]; then
+			error "syslog-ng is not exist, or no x right"
+		else
+			logconf_path=$rcsyslog_conf_def_path
+			logsrv_cmd=$rcsyslog_srv_cmd
+		fi
+	else
+	    logconf_path=$syslogd_conf_def_path
+	    logsrv_cmd=$syslogd_srv_cmd
+	fi
+fi
+
+#info "logd_path=$($logd_test)"
+info "logconf_path=$logconf_path"
+info "logsrv_cmd=$logsrv_cmd"
+
+if [ ! -f $logconf_path ]; then
+	error "$logconf_path not exist"
+fi
+
+# lograte的配置文件路径
+lograteconf_path="/etc/logrotate.conf"
+if [ ! -f $lograteconf_path ]; then
+	error "$lograteconf_path not exist"
+fi
+edrlograte_path="/etc/logrotate.d/sangfor_edr"
+
+# iptable日志存储路径
+iptable_log_path="/var/log/iptable.log"
+conf_modify_flag="#edr 1.0 add"
+sshd_modify_flag="#sshd_modify_flag edr 1.0 add"
+
+#系统用户组路径
+group_path="/etc/group"
+
+# syslog-ng配置iptbales过滤器
+syslog_ng_iptbales_filter='filter f_iptables   { facility(kern) and match("IN=") and match("OUT="); };'
+# syslog-ng配置iptable destination
+syslog_ng_iptables_destination='destination firewall { file("/var/log/iptable.log"); };'
+# syslog-ng配置iptable log
+syslog_ng_iptables_log='log { source(src); filter(f_iptables); destination(firewall); };'
+
+# syslog-ng配置sshd过滤器
+syslog_ng_sshd_filter="filter f_sshd	{ facility(auth, authpriv); };"
+# syslog-ng配置sshd destination
+syslog_ng_sshd_destination='destination sshd { file("/var/log/secure"); };'
+# syslog-ng配置sshd log
+syslog_ng_sshd_log="log { source(src); filter(f_sshd); destination(sshd); };"
+
+function install(){
+	restart_falg="false"
+	
+	if [ "$logconf_path" == "$rcsyslog_conf_def_path" ]; then
+		# 对于syslog-ng则需要单独处理
+		info "current system log path is $logconf_path."
+		if [ ! -f "$rcsyslog_bak_conf_path" ]; then
+			#不存在，则备份$rcsyslog_conf_def_path
+			cp $logconf_path $rcsyslog_bak_conf_path || error "cp $logconf_path $rcsyslog_bak_conf_path failed"
+			restart_falg="true"
+			grep -q "destination firewall" $logconf_path
+			if [ $? == 0 ]; then
+				info "there is default iptables log configure in $logconf_path."
+				sed -i 's/\/var\/log\/firewall/\/var\/log\/iptable.log/' $logconf_path || error "modify /var/log/firewall failed"
+			else
+				echo "$syslog_ng_iptbales_filter" >> $logconf_path || error "add $syslog_ng_iptbales_filter failed"
+				echo "$syslog_ng_iptables_destination" >> $logconf_path || error "add $syslog_ng_iptables_destination failed"
+				echo "$syslog_ng_iptables_log" >> $logconf_path || error "add $syslog_ng_iptables_log failed"
+			fi
+		else
+			#存在，则不需要改变
+			info "no need to bak $rcsyslog_conf_def_path to enable iptables log"
+		fi
+		
+		# 配置sshd登录日志
+		grep -q "destination sshd" $logconf_path
+		if [ $? == 0 ]; then
+			info "no need to modify $rcsyslog_conf_def_path to enable sshd log"
+		else
+			restart_falg="true"
+			echo "$syslog_ng_sshd_filter" >> $logconf_path || error "add $syslog_ng_sshd_filter failed"
+			echo "$syslog_ng_sshd_destination" >> $logconf_path || error "add $syslog_ng_sshd_destination failed"
+			echo "$syslog_ng_sshd_log" >> $logconf_path || error "add $syslog_ng_sshd_log failed"
+		fi
+	else
+		# 修改rsyslogd_conf_def_path文件: 不得重复修改
+		grep -q "$conf_modify_flag" $logconf_path
+		if [ $? == 0 ]; then
+			info "no need to modify $logconf_path again to enable iptables log"
+		else
+			restart_falg="true"
+			echo "$conf_modify_flag" >> $logconf_path || error "modify $logconf_path failed"
+			echo "kern.* $iptable_log_path" >> $logconf_path || C "modify $logconf_path failed"
+			echo "$conf_modify_flag" >> $logconf_path || error "modify $logconf_path failed"
+		fi
+		
+		# 修改rsyslogd_conf_def_path文件：不得重复修改
+		grep -q "$sshd_modify_flag" $logconf_path
+		if [ $? == 0 ]; then
+			info "already modified, no need to modify again to change sshd log type"
+		else
+			#该分支要进行一次判断，防止不存在出错
+			grep -q "^authpriv\.\*.*\/var\/log\/secure\$" $logconf_path
+			if [ $? == 0 ]; then
+				#修改之
+				restart_falg="true"
+				sed -i "s/^authpriv\.\*\(.*\/var\/log\/secure\)$/auth\.\*,authpriv\.\*\1/g" $logconf_path
+				if [ $? != 0 ]; then
+					error "sed failed: authpriv.* -> auth.*, authpriv.*"
+				else
+					sed -i "/^auth\.\*,authpriv\.\*.*\/var\/log\/secure$/a$sshd_modify_flag" $logconf_path
+					if [ $? != 0 ]; then
+						error "sed failed: insert $sshd_modify_flag"
+					fi
+				fi
+			else
+				info "file: $logconf_path no need to modify"
+			fi
+		fi
+	fi
+	
+	#没有这个配置文件，直接生成
+	if [ -f $edrlograte_path ];then
+		echo "$edrlograte_path has exist"
+	else
+		echo -e "#add edr 3.2\n${iptable_log_path} {\n    rotate 5\n    daily\n    missingok\n    nocompress\n}\n#end edr 3.1" >> $edrlograte_path
+		restart_falg="true"
+		grep -e "[[:space:]]*include[[:space:]]*/etc/logrotate.d" $lograteconf_path
+		if [ $? -ne 0 ]; then
+			echo "include /etc/logrotate.d" >> $lograteconf_path
+		fi
+	fi
+	#删掉原来的
+	grep -q "$conf_modify_flag" $lograteconf_path
+	if [ $? == 0 ]; then
+		restart_falg="true"
+		sed -i -e '/^#edr 1.0 add/,$d' $lograteconf_path
+		#删除所有日志文件
+		rm -rf "${iptable_log_path}"*
+	fi
+	
+	if [ "e$restart_falg" = "etrue" ]; then
+		# 如果已经存在了日志文件，则先删除
+		if [ -f $iptable_log_path ]; then
+			rm -f $iptable_log_path || error "rm $iptable_log_path failed"
+		fi
+
+		$logsrv_cmd > /dev/null 2>&1 || uninstall
+	fi
+	return 0
+}
+
+# 卸载
+function uninstall()
+{
+	if [ "$logconf_path" == "$rcsyslog_conf_def_path" ]; then
+		#去除rcsyslog_conf_def_path中的配置
+		if [ ! -f "$rcsyslog_bak_conf_path" ]; then
+			info "not exist $rcsyslog_bak_conf_path, no need to restore $logconf_path"
+		else
+			rm -f $rcsyslog_conf_def_path || error "delete $rcsyslog_conf_def_path failed"
+			mv $rcsyslog_bak_conf_path $rcsyslog_conf_def_path || error "copy $rcsyslog_bak_conf_path $rcsyslog_conf_def_path failed"
+		fi
+	else
+		#去除rsyslogd_conf_def_path中的配置
+		grep -q "$conf_modify_flag" $logconf_path
+		if [ $? == 0 ]; then
+			edr_add_n=`sed -n "/${conf_modify_flag}/=" /etc/rsyslog.conf | sed -n "1p"`
+			edr_add_m=`sed -n "/${conf_modify_flag}/=" /etc/rsyslog.conf | sed -n "2p"`
+			sed -i "${edr_add_n},${edr_add_m}d" $logconf_path || error "modify $logconf_path failed"
+		else
+			info "not exist $conf_modify_flag, no need to modify $logconf_path"
+		fi
+		
+		#删除edr配置文件
+		rm -rf $edrlograte_path
+		
+		grep -q "$sshd_modify_flag" $logconf_path
+		if [ $? == 0 ]; then
+			#存在则要将其还原
+			sed -i "s/^auth\.\*,authpriv\.\*\(.*\/var\/log\/secure\)$/authpriv\.\*\1/g" $logconf_path
+			if [ $? != 0 ]; then
+				error "sed failed: auth.*, authpriv.* -> authpriv.*"
+			fi
+			sed -i "/^${sshd_modify_flag}$/d" $logconf_path
+			if [ $? != 0 ]; then
+				error "sed failed: delete ${sshd_modify_flag}"
+			fi
+		else
+			info "not exist $sshd_modify_flag, no need to modify $logconf_path"
+		fi
+	fi
+	
+	grep -q "$conf_modify_flag" $lograteconf_path
+	if [ $? == 0 ]; then
+		sed -i '/^#edr 1.0 add$/,$d' $lograteconf_path || error "modify $lograteconf_path failed"
+	else
+		info "not exist $conf_modify_flag, no need to modify $lograteconf_path"
+	fi
+	
+	# 如果已经存在了日志文件，则先删除
+	if [ -f $iptable_log_path ]; then
+		rm -f $iptable_log_path || error "rm $iptable_log_path failed"
+	fi
+	
+	# 重启syslog服务,由于当syslog服务出现异常时重启会卡住，所以这里加个超时处理，10秒没有成功则报错
+	$logsrv_cmd > /dev/null 2>&1 || error "run $logsrv_cmd failed"
+	return 0
+}
+
+function main(){
+	if [ "e$model" == "e-i" ]; then
+		install || error "run install failed"
+	elif [ "e$model" == "e-u" ]; then
+		uninstall || error "run uninstall failed"
+	else
+		error "Illegal arg"
+	fi
+	return 0
+}
+
+main
+if [ $? != 0 ]; then
+	error "run main failed"
+else
+	info "modify syslog success"
+fi
+
+exit 0
